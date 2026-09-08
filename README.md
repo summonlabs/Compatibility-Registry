@@ -162,4 +162,5 @@ target_link_libraries(my_app PRIVATE CompatibilityRegistry::compat)
 Include the public umbrella header `compat/compat.hpp` (all types are in namespace `compat`). See `EXAMPLES.md` for runnable walkthroughs and `ARCHITECTURE.md` for the design.
 
 ## License
+
 Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.

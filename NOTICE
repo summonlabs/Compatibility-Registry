@@ -1,8 +1,8 @@
 Compatibility Registry
 
-Copyright © Summon Software Labs
+Copyright 2026 Summon Software Labs
 
-Compatibility Registry is an open-source, vendor-neutral registry for canonical compatibility identities across models, tokenizers, tensor layouts, KV formats, kernels, graphs, backends, drivers, accelerator capabilities, adapters, protocols, and runtime policy.
+Compatibility Registry is an open-source, vendor-neutral runtime for canonical compatibility identities across models, tokenizers, tensor layouts, KV formats, kernels, graphs, backends, drivers, accelerator capabilities, adapters, protocols, and runtime policy.
 
 This product is licensed under the Apache License, Version 2.0. See the
 LICENSE file in this distribution for the full license text.
