@@ -99,8 +99,9 @@ bool CompatibilityRegistry::has_cycle() const {
 }
 
 bool CompatibilityRegistry::create_cycle(Uuid from, const std::vector<Uuid>& to) const {
-    // Build a temporary graph with the prospective edge and detect a cycle.
+    // Build the prospective graph (`from`'s edges replaced by `to`) and detect a cycle.
     auto g = deps_;
+    g[from].clear();
     for (const auto& d : to) { if (d != from) g[from].push_back(d); }
     std::sort(g[from].begin(), g[from].end());
     g[from].erase(std::unique(g[from].begin(), g[from].end()), g[from].end());
@@ -138,19 +139,21 @@ ProfileId CompatibilityRegistry::register_profile(ProfileRecord rec) {
         if (latest.active && latest.fingerprint == rec.fingerprint && latest.deps == rec.deps && latest.kind == rec.kind) {
             return ProfileId{rec.id};
         }
-        // New generation: supersede the current latest in place (mark superseded).
-        for (auto& p : hist) { if (p.active) { p.active = false; p.superseded = true; } }
+    }
+    // Reject dependency cycles before mutating authoritative state (the current
+    // generation used to be marked superseded first, so a rejected update left
+    // the profile with no active generation).
+    if (create_cycle(rec.id, rec.deps)) {
+        throw std::runtime_error("register_profile: dependency cycle rejected for " + rec.id.to_string());
     }
     // Assign a generation.
     Generation gen{1};
     if (it != profiles_.end()) {
         gen.value = it->second.back().generation.value + 1;
+        // New generation: supersede the current latest in place (mark superseded).
+        for (auto& p : it->second) { if (p.active) { p.active = false; p.superseded = true; } }
     }
     rec.generation = gen;
-    // Reject dependency cycles before mutating authoritative state.
-    if (create_cycle(rec.id, rec.deps)) {
-        throw std::runtime_error("register_profile: dependency cycle rejected for " + rec.id.to_string());
-    }
     profiles_[rec.id].push_back(rec);
     add_dependency(rec.id, rec.deps);
     registry_gen_++;
@@ -174,12 +177,13 @@ ProfileId CompatibilityRegistry::supersede_profile(ProfileKind kind, Uuid id, Ca
     if (latest.active && latest.fingerprint == rec.fingerprint && latest.deps == rec.deps) {
         return ProfileId{id}; // no semantic change
     }
-    for (auto& p : it->second) { if (p.active) { p.active = false; p.superseded = true; } }
-    rec.generation = Generation{latest.generation.value + 1};
-    remove_dependency(id);
+    // Reject dependency cycles before mutating authoritative state.
     if (create_cycle(id, rec.deps)) {
         throw std::runtime_error("supersede_profile: dependency cycle rejected for " + id.to_string());
     }
+    rec.generation = Generation{latest.generation.value + 1};
+    for (auto& p : it->second) { if (p.active) { p.active = false; p.superseded = true; } }
+    remove_dependency(id);
     it->second.push_back(rec);
     add_dependency(id, rec.deps);
     registry_gen_++;
@@ -250,7 +254,9 @@ CompatibilityRuleId CompatibilityRegistry::register_rule(CompatibilityRule rule)
     std::lock_guard<std::mutex> lk(mutex_);
     if (rule.generation.value == 0) {
         auto it = rules_.find(rule.rule_id);
-        if (it != rules_.end() && it->second.active) {
+        // A known rule continues its own generations, also after it was
+        // disabled (a fresh counter value could repeat an earlier generation).
+        if (it != rules_.end()) {
             rule.generation.value = it->second.rule.generation.value + 1;
         } else {
             rule.generation.value = ++rule_gen_;
@@ -297,11 +303,19 @@ std::vector<CompatibilityRule> CompatibilityRegistry::active_rules() const {
 // ---------------------------------------------------------------------------
 // Evidence
 // ---------------------------------------------------------------------------
-void CompatibilityRegistry::register_evidence(EvidenceRecord ev) {
+bool CompatibilityRegistry::register_evidence(EvidenceRecord ev) {
     std::lock_guard<std::mutex> lk(mutex_);
+    // Evidence from a source at an older generation than the newest seen from
+    // that source is stale and is discarded.
+    if (!ev.source.empty()) {
+        std::uint64_t& newest = source_generation_[ev.source];
+        if (ev.source_generation.value < newest) return false;
+        newest = ev.source_generation.value;
+    }
     evidence_[ev.id] = std::move(ev);
     evidence_gen_++;
     registry_gen_++;
+    return true;
 }
 
 const EvidenceRecord* CompatibilityRegistry::find_evidence(EvidenceId id) const {
@@ -824,7 +838,7 @@ static Canon enc_evidence(const EvidenceRecord& e) {
     Canon::put_uuid(r, 1, e.id.value);
     Canon::put_uuid(r, 2, e.subject);
     Canon::put_str(r, 3, e.field);
-    Canon::put_record(r, 4, e.value.as_record());
+    Canon::put(r, 4, e.value);   // any kind (as_record() dropped scalar values)
     Canon::put_str(r, 5, e.provenance);
     Canon::put_str(r, 6, e.source);
     Canon::put_uint(r, 7, e.source_generation.value);
@@ -892,9 +906,19 @@ std::vector<std::uint8_t> CompatibilityRegistry::snapshot() const {
 // ---------------------------------------------------------------------------
 // Deserialization helpers
 // ---------------------------------------------------------------------------
+// An enum value read from a snapshot must name a defined enumerator.
+template <typename E>
+static E checked_enum(const Canon* v, E last, const char* what) {
+    const std::uint64_t raw = v->as_uint();
+    if (raw > static_cast<std::uint64_t>(last)) {
+        throw std::runtime_error(std::string("recover: invalid ") + what + " " + std::to_string(raw));
+    }
+    return static_cast<E>(raw);
+}
+
 static Constraint dec_constraint(const Canon& c) {
     Constraint x;
-    auto v = c.field(1); if (v && v->kind()==CanonKind::Uint) x.op = static_cast<PredOp>(v->as_uint());
+    auto v = c.field(1); if (v && v->kind()==CanonKind::Uint) x.op = checked_enum(v, PredOp::Truthy, "predicate");
     v = c.field(2); if (v && v->kind()==CanonKind::Str) x.field = v->as_string();
     v = c.field(3); if (v && v->kind()==CanonKind::Str) x.right_field = v->as_string();
     v = c.field(4); if (v) x.expected = *v;
@@ -917,7 +941,7 @@ static ConstraintItem dec_constraint_item(const Canon& c) {
 static ProfileRecord dec_profile(const Canon& c) {
     ProfileRecord p;
     auto v = c.field(1); if (v && v->kind()==CanonKind::Uuid) p.id = v->as_uuid();
-    v = c.field(2); if (v && v->kind()==CanonKind::Uint) p.kind = static_cast<ProfileKind>(v->as_uint());
+    v = c.field(2); if (v && v->kind()==CanonKind::Uint) p.kind = checked_enum(v, ProfileKind::CapabilitySet, "profile kind");
     v = c.field(3); if (v && v->kind()==CanonKind::Uint) p.generation.value = v->as_uint();
     v = c.field(4); if (v && v->kind()==CanonKind::Record) p.payload = Canon::mk_record(v->as_record());
     v = c.field(5); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) if (e.kind()==CanonKind::Uuid) p.deps.push_back(e.as_uuid());
@@ -935,10 +959,10 @@ static void dec_rule(const Canon& c, RuleRecord& rr) {
     v = c.field(4); if (v && v->kind()==CanonKind::Str) rr.rule.scope = v->as_string();
     v = c.field(5); if (v && v->kind()==CanonKind::Int) rr.rule.priority = static_cast<int>(v->as_int());
     v = c.field(6); if (v && v->kind()==CanonKind::Bool) rr.active = v->as_bool();
-    v = c.field(7); if (v && v->kind()==CanonKind::Uint) rr.rule.left_kind = static_cast<ProfileKind>(v->as_uint());
-    v = c.field(8); if (v && v->kind()==CanonKind::Uint) rr.rule.right_kind = static_cast<ProfileKind>(v->as_uint());
-    v = c.field(9); if (v && v->kind()==CanonKind::Uint) rr.rule.kind = static_cast<RuleKind>(v->as_uint());
-    v = c.field(10); if (v && v->kind()==CanonKind::Uint) rr.rule.outcome = static_cast<Outcome>(v->as_uint());
+    v = c.field(7); if (v && v->kind()==CanonKind::Uint) rr.rule.left_kind = checked_enum(v, ProfileKind::CapabilitySet, "profile kind");
+    v = c.field(8); if (v && v->kind()==CanonKind::Uint) rr.rule.right_kind = checked_enum(v, ProfileKind::CapabilitySet, "profile kind");
+    v = c.field(9); if (v && v->kind()==CanonKind::Uint) rr.rule.kind = checked_enum(v, RuleKind::PolicyOverride, "rule kind");
+    v = c.field(10); if (v && v->kind()==CanonKind::Uint) rr.rule.outcome = checked_enum(v, Outcome::InsufficientEvidence, "outcome");
     v = c.field(11); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) rr.rule.required.push_back(dec_constraint(e));
     v = c.field(12); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) rr.rule.any_of.push_back(dec_constraint(e));
     v = c.field(13); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) rr.rule.incompatible_with.push_back(dec_constraint(e));
@@ -952,12 +976,12 @@ static EvidenceRecord dec_evidence(const Canon& c) {
     auto v = c.field(1); if (v && v->kind()==CanonKind::Uuid) e.id = EvidenceId(v->as_uuid());
     v = c.field(2); if (v && v->kind()==CanonKind::Uuid) e.subject = v->as_uuid();
     v = c.field(3); if (v && v->kind()==CanonKind::Str) e.field = v->as_string();
-    v = c.field(4); if (v && v->kind()==CanonKind::Record) e.value = Canon::mk_record(v->as_record());
+    v = c.field(4); if (v) e.value = *v;
     v = c.field(5); if (v && v->kind()==CanonKind::Str) e.provenance = v->as_string();
     v = c.field(6); if (v && v->kind()==CanonKind::Str) e.source = v->as_string();
     v = c.field(7); if (v && v->kind()==CanonKind::Uint) e.source_generation.value = v->as_uint();
     v = c.field(8); if (v && v->kind()==CanonKind::Str) e.observed_timestamp = v->as_string();
-    v = c.field(9); if (v && v->kind()==CanonKind::Uint) e.kind = static_cast<EvidenceKind>(v->as_uint());
+    v = c.field(9); if (v && v->kind()==CanonKind::Uint) e.kind = checked_enum(v, EvidenceKind::Unavailable, "evidence kind");
     v = c.field(10); if (v && v->kind()==CanonKind::Bool) e.validated = v->as_bool();
     v = c.field(11); if (v && v->kind()==CanonKind::Str) e.digest_hex = v->as_string();
     return e;
@@ -977,7 +1001,7 @@ static CompatibilityDecision dec_decision(const Canon& c) {
     auto v = c.field(1); if (v && v->kind()==CanonKind::Uuid) d.decision_id = v->as_uuid();
     v = c.field(2); if (v && v->kind()==CanonKind::Uuid) d.left = v->as_uuid();
     v = c.field(3); if (v && v->kind()==CanonKind::Uuid) d.right = v->as_uuid();
-    v = c.field(4); if (v && v->kind()==CanonKind::Uint) d.outcome = static_cast<Outcome>(v->as_uint());
+    v = c.field(4); if (v && v->kind()==CanonKind::Uint) d.outcome = checked_enum(v, Outcome::InsufficientEvidence, "outcome");
     v = c.field(5); if (v && v->kind()==CanonKind::Uuid) d.rule_id = v->as_uuid();
     v = c.field(6); if (v && v->kind()==CanonKind::Uint) d.rule_generation.value = v->as_uint();
     v = c.field(7); if (v && v->kind()==CanonKind::Uuid) d.policy_id = v->as_uuid();
@@ -1016,13 +1040,28 @@ std::unique_ptr<CompatibilityRegistry> CompatibilityRegistry::recover(std::span<
         if (!p.fingerprint.empty() && canonical_fingerprint_hex(p.payload) != p.fingerprint) throw std::runtime_error("recover: profile fingerprint mismatch (corruption)");
         reg->profiles_[p.id].push_back(std::move(p));
     }
+    // Each profile's history must carry strictly increasing generations from 1.
+    for (const auto& [id, hist] : reg->profiles_) {
+        std::uint64_t prev = 0;
+        for (const auto& p : hist) {
+            if (p.generation.value <= prev) throw std::runtime_error("recover: impossible profile generation for " + id.to_string());
+            prev = p.generation.value;
+        }
+    }
     // rebuild dependency edges
     for (auto& [id, hist] : reg->profiles_) { for (auto& p : hist) reg->add_dependency(id, p.deps); }
     v = doc.field(4); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) {
-        RuleRecord rr; dec_rule(e, rr); reg->rules_[rr.rule.rule_id] = std::move(rr);
+        RuleRecord rr; dec_rule(e, rr);
+        if (rr.rule.generation.value == 0) throw std::runtime_error("recover: impossible rule generation");
+        reg->rules_[rr.rule.rule_id] = std::move(rr);
     }
     v = doc.field(5); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) {
-        EvidenceRecord ev = dec_evidence(e); reg->evidence_[ev.id] = std::move(ev);
+        EvidenceRecord ev = dec_evidence(e);
+        if (!ev.source.empty()) {
+            std::uint64_t& newest = reg->source_generation_[ev.source];
+            newest = std::max(newest, ev.source_generation.value);
+        }
+        reg->evidence_[ev.id] = std::move(ev);
     }
     v = doc.field(6); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) reg->invalidations_.push_back(dec_invalidation(e));
     v = doc.field(7); if (v && v->kind()==CanonKind::Sequence) for (auto& e : v->as_seq()) {

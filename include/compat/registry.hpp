@@ -109,7 +109,9 @@ public:
     std::vector<CompatibilityRule> active_rules() const;
 
     // --- evidence ---
-    void register_evidence(EvidenceRecord ev);
+    // Returns false (and stores nothing) for evidence whose source generation
+    // is older than the newest seen from the same source.
+    bool register_evidence(EvidenceRecord ev);
     const EvidenceRecord* find_evidence(EvidenceId id) const;
 
     // --- policy ---
@@ -154,6 +156,7 @@ private:
     std::unordered_map<Uuid, std::deque<ProfileRecord>, UuidHash> profiles_;
     std::unordered_map<Uuid, RuleRecord, UuidHash> rules_;
     std::unordered_map<Uuid, EvidenceRecord, UuidHash> evidence_;
+    std::unordered_map<std::string, std::uint64_t> source_generation_;  // newest generation per evidence source
     mutable std::unordered_map<Sha256::Digest, CompatibilityDecision, DigestHash> decisions_;
     std::vector<Invalidation> invalidations_;
     std::unordered_map<Uuid, std::vector<Uuid>, UuidHash> deps_;      // id -> deps

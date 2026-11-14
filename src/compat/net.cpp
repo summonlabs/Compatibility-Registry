@@ -143,13 +143,17 @@ static Canon enc_constraint_wire(const Constraint& c) {
     Canon::put(r, 4, c.expected);
     return Canon::mk_record(std::move(r));
 }
-static Constraint dec_constraint_wire(const Canon& c) {
-    Constraint x;
-    const Canon* v = c.field(1); if (v && v->kind()==CanonKind::Uint) x.op = static_cast<PredOp>(v->as_uint());
+// Returns false for a constraint whose predicate is not a known PredOp.
+static bool dec_constraint_wire(const Canon& c, Constraint& x) {
+    const Canon* v = c.field(1);
+    if (v && v->kind()==CanonKind::Uint) {
+        if (v->as_uint() > static_cast<std::uint64_t>(PredOp::Truthy)) return false;
+        x.op = static_cast<PredOp>(v->as_uint());
+    }
     v = c.field(2); if (v && v->kind()==CanonKind::Str) x.field = v->as_string();
     v = c.field(3); if (v && v->kind()==CanonKind::Str) x.right_field = v->as_string();
     v = c.field(4); if (v) x.expected = *v;
-    return x;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +248,7 @@ bool RegistryClient::register_evidence(const std::string& source, const Uuid& bo
     Canon::Record r = Canon::rec();
     Canon::put_str(r, 1, source); Canon::put_uuid(r, 2, boot_id); Canon::put_uint(r, 3, source_gen);
     Canon::put_str(r, 4, ev.field);
-    Canon::put_record(r, 5, ev.value.as_record());
+    Canon::put(r, 5, ev.value);   // any kind (as_record() dropped scalar values)
     Canon::put_uint(r, 100u, epoch_);
     NetMessage resp;
     if (!send(MsgType::RegisterEvidence, Canon::mk_record(std::move(r)), resp, err)) return false;
@@ -344,7 +348,10 @@ void CoordinatorServer::run() {
             NetMessage msg; std::string err;
             if (!recv_frame(static_cast<std::uint64_t>(cs), msg, err)) break;
             NetMessage resp;
-            bool ok = handle_request(msg, resp);
+            // A request that throws is answered with an error frame; it must
+            // not terminate the coordinator.
+            bool ok = false;
+            try { ok = handle_request(msg, resp); } catch (const std::exception&) { ok = false; }
             auto frame = frame_message(ok ? resp.type : MsgType::Error, ok ? resp.payload : err_rec("request failed"));
             if (!sock_send_all(static_cast<std::uint64_t>(cs), frame.data(), frame.size())) break;
             if (msg.type == MsgType::Shutdown) { running_ = false; break; }
@@ -384,6 +391,7 @@ bool CoordinatorServer::handle_request(const NetMessage& msg, NetMessage& respon
             std::uint64_t epoch = 0; const Canon* ev = msg.payload.field(kEpochTag);
             if (ev && ev->kind()==CanonKind::Uint) epoch = ev->as_uint();
             if (!prof || prof->kind()!=CanonKind::Record || !kindv || kindv->kind()!=CanonKind::Uint) { response.payload = err_rec("bad profile"); return false; }
+            if (kindv->as_uint() > static_cast<std::uint64_t>(ProfileKind::CapabilitySet)) { response.payload = err_rec("bad profile kind"); return false; }
             ProfileKind kind = static_cast<ProfileKind>(kindv->as_uint());
             { std::lock_guard<std::mutex> lk(mtx_);
               if (epoch != epoch_) { response.payload = err_rec("stale coordinator epoch"); return false; }
@@ -401,40 +409,71 @@ bool CoordinatorServer::handle_request(const NetMessage& msg, NetMessage& respon
         case MsgType::RegisterRule: {
             std::string source = msg.field_str(1);
             Uuid boot; msg.field_uuid(2, boot);
+            std::uint64_t sgen = 0; const Canon* sv = msg.payload.field(3);
+            if (sv && sv->kind()==CanonKind::Uint) sgen = sv->as_uint();
             Uuid rid; msg.field_uuid(4, rid);
             std::uint64_t epoch = 0; const Canon* ev = msg.payload.field(kEpochTag);
             if (ev && ev->kind()==CanonKind::Uint) epoch = ev->as_uint();
+            CompatibilityRule rule; rule.rule_id = CompatibilityRuleId(rid);
+            rule.scope = msg.field_str(6); rule.domain = msg.field_str(7);
+            const Canon* pv = msg.payload.field(8); if (pv && pv->kind()==CanonKind::Int) rule.priority = static_cast<int>(pv->as_int());
+            const Canon* ov = msg.payload.field(9);
+            if (ov && ov->kind()==CanonKind::Uint) {
+                if (ov->as_uint() > static_cast<std::uint64_t>(Outcome::InsufficientEvidence)) { response.payload = err_rec("bad rule outcome"); return false; }
+                rule.outcome = static_cast<Outcome>(ov->as_uint());
+            }
+            const Canon* vq = msg.payload.field(10);
+            if (vq && vq->kind()==CanonKind::Sequence) for (auto& e : vq->as_seq()) {
+                Constraint c; if (!dec_constraint_wire(e, c)) { response.payload = err_rec("bad constraint op"); return false; }
+                rule.required.push_back(std::move(c));
+            }
+            const Canon* vi = msg.payload.field(11);
+            if (vi && vi->kind()==CanonKind::Sequence) for (auto& e : vi->as_seq()) {
+                Constraint c; if (!dec_constraint_wire(e, c)) { response.payload = err_rec("bad constraint op"); return false; }
+                rule.incompatible_with.push_back(std::move(c));
+            }
+            const Canon* lkv = msg.payload.field(12);
+            if (lkv && lkv->kind()==CanonKind::Uint) {
+                if (lkv->as_uint() > static_cast<std::uint64_t>(ProfileKind::CapabilitySet)) { response.payload = err_rec("bad rule left kind"); return false; }
+                rule.left_kind = static_cast<ProfileKind>(lkv->as_uint());
+            }
+            const Canon* rkv = msg.payload.field(13);
+            if (rkv && rkv->kind()==CanonKind::Uint) {
+                if (rkv->as_uint() > static_cast<std::uint64_t>(ProfileKind::CapabilitySet)) { response.payload = err_rec("bad rule right kind"); return false; }
+                rule.right_kind = static_cast<ProfileKind>(rkv->as_uint());
+            }
             { std::lock_guard<std::mutex> lk(mtx_);
               if (epoch != epoch_) { response.payload = err_rec("stale coordinator epoch"); return false; }
               auto it = sources_.find(source);
               if (it == sources_.end() || it->second.boot_id != boot) { response.payload = err_rec("stale SourceBootId"); return false; }
+              if (sgen < it->second.generation) { response.payload = err_rec("stale source generation"); return false; }
+              if (it->second.scope != "*" && it->second.scope != rule.domain) { response.payload = err_rec("source not authorized for domain"); return false; }
             }
-            CompatibilityRule rule; rule.rule_id = CompatibilityRuleId(rid);
-            rule.scope = msg.field_str(6); rule.domain = msg.field_str(7);
-            const Canon* pv = msg.payload.field(8); if (pv && pv->kind()==CanonKind::Int) rule.priority = static_cast<int>(pv->as_int());
-            const Canon* ov = msg.payload.field(9); if (ov && ov->kind()==CanonKind::Uint) rule.outcome = static_cast<Outcome>(ov->as_uint());
-            const Canon* vq = msg.payload.field(10); if (vq && vq->kind()==CanonKind::Sequence) for (auto& e : vq->as_seq()) rule.required.push_back(dec_constraint_wire(e));
-            const Canon* vi = msg.payload.field(11); if (vi && vi->kind()==CanonKind::Sequence) for (auto& e : vi->as_seq()) rule.incompatible_with.push_back(dec_constraint_wire(e));
-            const Canon* lkv = msg.payload.field(12); if (lkv && lkv->kind()==CanonKind::Uint) rule.left_kind = static_cast<ProfileKind>(lkv->as_uint());
-            const Canon* rkv = msg.payload.field(13); if (rkv && rkv->kind()==CanonKind::Uint) rule.right_kind = static_cast<ProfileKind>(rkv->as_uint());
             registry_->register_rule(rule);
+            { std::lock_guard<std::mutex> lk(mtx_); auto it = sources_.find(source); if (it != sources_.end()) it->second.generation = sgen; }
             response.payload = ack_rec();
             return true;
         }
         case MsgType::RegisterEvidence: {
             std::string source = msg.field_str(1);
             Uuid boot; msg.field_uuid(2, boot);
+            std::uint64_t sgen = 0; const Canon* sv = msg.payload.field(3);
+            if (sv && sv->kind()==CanonKind::Uint) sgen = sv->as_uint();
             std::uint64_t epoch = 0; const Canon* ev = msg.payload.field(kEpochTag);
             if (ev && ev->kind()==CanonKind::Uint) epoch = ev->as_uint();
             { std::lock_guard<std::mutex> lk(mtx_);
               if (epoch != epoch_) { response.payload = err_rec("stale coordinator epoch"); return false; }
               auto it = sources_.find(source);
               if (it == sources_.end() || it->second.boot_id != boot) { response.payload = err_rec("stale SourceBootId"); return false; }
+              if (sgen < it->second.generation) { response.payload = err_rec("stale source generation"); return false; }
             }
             EvidenceRecord e; e.id = EvidenceId::genseed();
             e.field = msg.field_str(4);
             const Canon* v = msg.payload.field(5); if (v) e.value = *v;
-            registry_->register_evidence(std::move(e));
+            e.source = source;
+            e.source_generation = Generation{sgen};
+            if (!registry_->register_evidence(std::move(e))) { response.payload = err_rec("stale source generation"); return false; }
+            { std::lock_guard<std::mutex> lk(mtx_); auto it = sources_.find(source); if (it != sources_.end()) it->second.generation = sgen; }
             response.payload = ack_rec();
             return true;
         }
@@ -455,6 +494,8 @@ bool CoordinatorServer::handle_request(const NetMessage& msg, NetMessage& respon
         case MsgType::Invalidate: {
             std::string source = msg.field_str(1);
             Uuid boot; msg.field_uuid(2, boot);
+            std::uint64_t sgen = 0; const Canon* sv = msg.payload.field(3);
+            if (sv && sv->kind()==CanonKind::Uint) sgen = sv->as_uint();
             Uuid target; msg.field_uuid(4, target);
             std::string reason = msg.field_str(5);
             std::uint64_t epoch = 0; const Canon* ev = msg.payload.field(kEpochTag);
@@ -463,8 +504,10 @@ bool CoordinatorServer::handle_request(const NetMessage& msg, NetMessage& respon
               if (epoch != epoch_) { response.payload = err_rec("stale coordinator epoch"); return false; }
               auto it = sources_.find(source);
               if (it == sources_.end() || it->second.boot_id != boot) { response.payload = err_rec("stale SourceBootId"); return false; }
+              if (sgen < it->second.generation) { response.payload = err_rec("stale source generation"); return false; }
             }
             registry_->invalidate_profile(target, reason);
+            { std::lock_guard<std::mutex> lk(mtx_); auto it = sources_.find(source); if (it != sources_.end()) it->second.generation = sgen; }
             response.payload = ack_rec();
             return true;
         }

@@ -196,6 +196,21 @@ static Ver parse_ver(std::string_view s) {
     return v;
 }
 
+// A value of an unexpected kind (a profile is free-form canonical data) makes
+// the constraint fail; it must not throw out of the evaluation.
+static bool is_version(const Canon& c) {
+    return c.kind()==CanonKind::Uint || c.kind()==CanonKind::Str || c.kind()==CanonKind::Bytes;
+}
+
+static bool as_number(const Canon& c, double& out) {
+    switch (c.kind()) {
+        case CanonKind::Float: out = c.as_float(); return true;
+        case CanonKind::Uint: out = static_cast<double>(c.as_uint()); return true;
+        case CanonKind::Int: out = static_cast<double>(c.as_int()); return true;
+        default: return false;
+    }
+}
+
 static int cmp_ver(const Canon& a, const Canon& b) {
     Ver av = a.kind()==CanonKind::Uint ? Ver{a.as_uint(), 0} : parse_ver(a.as_string());
     Ver bv = b.kind()==CanonKind::Uint ? Ver{b.as_uint(), 0} : parse_ver(b.as_string());
@@ -255,15 +270,15 @@ bool Constraint::evaluate(const Canon& left, const Canon& right, ProfileKind lk,
         }
         case PredOp::Min: {
             if (!lv) { why_not = "field '" + field + "' unknown on left"; return false; }
-            auto a = lv->kind()==CanonKind::Float ? lv->as_float() : static_cast<double>(lv->kind()==CanonKind::Uint ? lv->as_uint() : lv->as_int());
-            auto b = expected.kind()==CanonKind::Float ? expected.as_float() : static_cast<double>(expected.kind()==CanonKind::Uint ? expected.as_uint() : expected.as_int());
+            double a = 0.0, b = 0.0;
+            if (!as_number(*lv, a) || !as_number(expected, b)) { why_not = "field '" + field + "' is not numeric"; return false; }
             if (a >= b) { why_ok = "meets minimum"; return true; }
             why_not = "below minimum"; return false;
         }
         case PredOp::Max: {
             if (!lv) { why_not = "field '" + field + "' unknown on left"; return false; }
-            auto a = lv->kind()==CanonKind::Float ? lv->as_float() : static_cast<double>(lv->kind()==CanonKind::Uint ? lv->as_uint() : lv->as_int());
-            auto b = expected.kind()==CanonKind::Float ? expected.as_float() : static_cast<double>(expected.kind()==CanonKind::Uint ? expected.as_uint() : expected.as_int());
+            double a = 0.0, b = 0.0;
+            if (!as_number(*lv, a) || !as_number(expected, b)) { why_not = "field '" + field + "' is not numeric"; return false; }
             if (a <= b) { why_ok = "within maximum"; return true; }
             why_not = "exceeds maximum"; return false;
         }
@@ -271,6 +286,7 @@ bool Constraint::evaluate(const Canon& left, const Canon& right, ProfileKind lk,
             if (!lv) { why_not = "field '" + field + "' unknown on left"; return false; }
             if (!right_field.empty() && !rv) { why_not = "field '" + right_field + "' unknown on right"; return false; }
             const Canon& rhs = right_field.empty() ? expected : *rv;
+            if (!is_version(*lv) || !is_version(rhs)) { why_not = "field '" + field + "' is not a version"; return false; }
             int c = cmp_ver(*lv, rhs);
             bool ok = false;
             if (op==PredOp::VersionLt) ok = c < 0;

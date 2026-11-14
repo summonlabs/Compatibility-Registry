@@ -173,7 +173,12 @@ struct Reader {
     }
 };
 
-static Canon parse_element(Reader& rd, std::size_t end) {
+// Bounds the decoder's recursion: untrusted input (network frames, snapshot
+// files) must not be able to exhaust the stack with nested containers.
+static constexpr std::size_t kMaxDepth = 128;
+
+static Canon parse_element(Reader& rd, std::size_t end, std::size_t depth) {
+    if (depth > kMaxDepth) throw CanonError("decode: nesting too deep");
     std::uint8_t kk = rd.u8();
     std::uint32_t len = rd.u32be();
     if (end - rd.pos < len) throw CanonError("decode: child element length exceeds segment");
@@ -202,14 +207,14 @@ static Canon parse_element(Reader& rd, std::size_t end) {
                 if (!first && tag <= lastTag) throw CanonError("decode: record tags not strictly increasing (duplicate/out-of-order)");
                 lastTag = tag;
                 first = false;
-                r.emplace_back(tag, parse_element(rd, payloadEnd));
+                r.emplace_back(tag, parse_element(rd, payloadEnd, depth + 1));
             }
             if (rd.pos != payloadEnd) throw CanonError("decode: record segment overrun");
             return Canon::mk_record(std::move(r));
         }
         case CanonKind::Sequence: {
             Canon::Seq q;
-            while (rd.pos < payloadEnd) q.push_back(parse_element(rd, payloadEnd));
+            while (rd.pos < payloadEnd) q.push_back(parse_element(rd, payloadEnd, depth + 1));
             if (rd.pos != payloadEnd) throw CanonError("decode: sequence segment overrun");
             return Canon::mk_seq(std::move(q));
         }
@@ -222,7 +227,7 @@ Canon canonical_decode(std::span<const std::uint8_t> bytes) {
     if (std::memcmp(bytes.data(), kMagic, 4) != 0) throw CanonError("decode: bad magic");
     if (bytes[4] != kVersion) throw CanonError("decode: unsupported version " + std::to_string(bytes[4]));
     Reader rd{ bytes.data(), bytes.size(), 5 };
-    Canon root = parse_element(rd, bytes.size());
+    Canon root = parse_element(rd, bytes.size(), 0);
     if (rd.pos != bytes.size()) throw CanonError("decode: trailing garbage");
     return root;
 }

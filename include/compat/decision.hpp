@@ -47,7 +47,7 @@ struct EvidenceRecord {
         Canon::put_uuid(r, 1, id.value);
         Canon::put_uuid(r, 2, subject);
         Canon::put_str(r, 3, field);
-        Canon::put_record(r, 4, value.as_record());
+        Canon::put(r, 4, value);   // any kind (as_record() dropped scalar values)
         Canon::put_str(r, 5, provenance);
         Canon::put_str(r, 6, source);
         Canon::put_uint(r, 7, source_generation.value);
